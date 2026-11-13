@@ -1025,7 +1025,7 @@ let ROOM=null, roomReady=null;
 const NET={sub:null,role:null,code:null,opp:null,waiters:[],offPeers:null,oppSeen:false};
 /* 연결 방식 자동 선택
    - claude.ai 안에서 열면: room 기능
-   - GitHub Pages 등 일반 웹에서 열면: PeerJS (브라우저끼리 직접 연결, 서버 불필요) */
+   - GitHub Pages 등 일반 웹에서 열면: 공용 중계 서버(MQTT) → 안 되면 PeerJS 직접 연결 */
 function loadScript(src){ return new Promise((ok,no)=>{ const s=document.createElement('script'); s.src=src; s.onload=ok; s.onerror=no; document.head.appendChild(s); }); }
 function peerRoom(){
   return { join: (name,role)=>new Promise((resolve,reject)=>{
@@ -1068,8 +1068,66 @@ function peerRoom(){
     setTimeout(()=>{ if(!done){ done=true; try{peer.destroy();}catch(_){} reject(new Error(role==='host'?'net':'notfound')); } },9000);
   })};
 }
+/* --- 중계 서버(MQTT) 연결: 통신망·공유기 종류와 상관없이 연결되도록 서버를 거쳐 상태를 주고받음 ---
+   공용 무료 브로커를 차례로 시도 (앞의 것이 안 되면 다음 것) */
+const MQTT_BROKERS=window.MP_BROKERS||['wss://broker.emqx.io:8084/mqtt','wss://broker.hivemq.com:8884/mqtt','wss://test.mosquitto.org:8081/mqtt'];
+const MQTT_NS='bazzipoker-v2/';
+function mqttRoom(){
+  function connectOne(url,will){
+    return new Promise((ok,no)=>{
+      let done=false;
+      const c=mqtt.connect(url,{clientId:'mp_'+Math.random().toString(36).slice(2,10),clean:true,connectTimeout:6000,reconnectPeriod:0,keepalive:20,will});
+      const fail=()=>{ if(done) return; done=true; try{c.end(true);}catch(e){} no(new Error('net')); };
+      c.once('connect',()=>{ if(done) return; done=true; c.options.reconnectPeriod=2000; ok(c); });
+      c.once('error',fail);
+      setTimeout(fail,7000);
+    });
+  }
+  return { kind:'mqtt', join: async (name,role)=>{
+    const base=MQTT_NS+name, myT=base+'/'+role, otT=base+'/'+(role==='host'?'guest':'host');
+    const myId=Math.random().toString(36).slice(2,10);
+    const will={topic:myT,payload:'',retain:true,qos:1};
+    let client=null;
+    for(const url of MQTT_BROKERS){ try{ client=await connectOne(url,will); break; }catch(e){} }
+    if(!client) throw new Error('net');
+    let mine={}, other=null, otherAt=0, subs=[], rival=false, closed=false;
+    const FRESH=20000;
+    const peersList=()=>[{peer:'me',sameTab:true,isMe:true,presence:mine},...(other?[{peer:'opp',sameTab:false,isMe:false,presence:other}]:[])];
+    const fire=()=>{ const ps=peersList(); subs.forEach(f=>{ try{ f({peers:ps}); }catch(e){} }); };
+    const pub=()=>{ if(closed) return; try{ client.publish(myT,JSON.stringify({id:myId,ts:Date.now(),p:mine}),{retain:true,qos:1}); }catch(e){} };
+    client.on('message',(topic,buf)=>{
+      if(closed) return;
+      if(!buf||!buf.length){ if(topic===otT&&other){ other=null; fire(); } return; }
+      let d; try{ d=JSON.parse(buf.toString()); }catch(e){ return; }
+      const fresh=Math.abs(Date.now()-(d.ts||0))<FRESH;
+      if(topic===myT){ if(d.id!==myId&&fresh) rival=true; return; }
+      if(topic===otT&&fresh){ other=d.p||{}; otherAt=Date.now(); fire(); }
+    });
+    client.on('connect',()=>{ if(!closed){ client.subscribe([myT,otT],{qos:1}); pub(); } }); // 재연결 시 다시 알림
+    await new Promise(r=>client.subscribe([myT,otT],{qos:1},()=>r()));
+    await new Promise(r=>setTimeout(r,1300)); // 같은 역할의 다른 사람이 있는지 확인
+    if(rival){ closed=true; try{client.end(true);}catch(e){} throw new Error(role==='host'?'taken':'full'); }
+    const hb=setInterval(pub,4000);
+    const wd=setInterval(()=>{ if(other&&Date.now()-otherAt>14000){ other=null; fire(); } },2000);
+    return {
+      peers:peersList,
+      onPeers:f=>{ subs.push(f); setTimeout(fire,0); return ()=>{ subs=subs.filter(x=>x!==f); }; },
+      presence:async p=>{ mine={...mine,...p}; for(const k in p) if(p[k]===null) delete mine[k]; pub(); fire(); },
+      leave:async()=>{ if(closed) return; clearInterval(hb); clearInterval(wd); subs=[];
+        try{ client.publish(myT,'',{retain:true,qos:1},()=>{ closed=true; client.end(false); }); }catch(e){}
+        setTimeout(()=>{ closed=true; try{client.end(true);}catch(e){} },1500); },
+    };
+  }};
+}
+
 roomReady=(async()=>{
   try{ if(window.claude&&typeof claude.use==='function'){ ROOM=await claude.use('room'); if(ROOM) return ROOM; } }catch(e){ ROOM=null; }
+  // 1순위: 중계 서버(MQTT) — 통신망 상관없이 연결
+  try{
+    if(!window.mqtt) await loadScript('https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js');
+    if(window.mqtt&&typeof mqtt.connect==='function'){ ROOM=mqttRoom(); return ROOM; }
+  }catch(e){}
+  // 2순위: PeerJS 직접 연결
   try{
     if(!window.Peer) await loadScript('https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js');
     if(window.Peer && window.RTCPeerConnection) ROOM=peerRoom();
@@ -1151,7 +1209,7 @@ async function createRoom(){
     if(id!==gameId||!NET.sub) return;
     $('onlineModal').classList.remove('on');
     hostLoop();
-  }catch(e){ olErr('방을 만들지 못했어요. 잠시 후 다시 시도해 주세요.'); await leaveRoom(); }
+  }catch(e){ olErr(e&&e.message==='net'?'연결 서버에 접속하지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.':'방을 만들지 못했어요. 잠시 후 다시 시도해 주세요.'); await leaveRoom(); }
   finally{ $('btnCreate').disabled=false; }
 }
 async function joinRoom(){
@@ -1161,7 +1219,7 @@ async function joinRoom(){
   olErr('입장하는 중…'); $('btnJoin').disabled=true;
   try{
     try{ await joinCode(code,'guest'); }catch(e){
-      return olErr(e&&e.message==='full'?'이미 대결 중인 방이에요.':e&&e.message==='notfound'?'방을 찾을 수 없어요. 코드를 확인해 주세요.':'연결하지 못했어요. 와이파이/데이터를 바꿔 다시 시도해 주세요.');
+      return olErr(e&&e.message==='full'?'이미 대결 중인 방이에요.':e&&e.message==='notfound'?'방을 찾을 수 없어요. 코드를 확인해 주세요.':'연결 서버에 접속하지 못했어요. 인터넷 연결을 확인하고 다시 시도해 주세요.');
     }
     const found=await Promise.race([waitFor(o=>!!o),sleep(5000).then(()=>null)]);
     if(!found){ await leaveRoom(); return olErr('방을 찾을 수 없어요. 코드를 확인해 주세요.'); }
